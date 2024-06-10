@@ -1,0 +1,784 @@
+import os
+import shutil
+import sys
+import yaml
+import numpy as np
+import pandas as pd
+import random
+from datetime import datetime
+
+import torch
+from torch import nn
+import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from sklearn.metrics import roc_auc_score, mean_squared_error, mean_absolute_error, root_mean_squared_error
+
+from dataset.dataset_test_recon import MolTestDatasetWrapper
+from dataset.get_config import get_config 
+import argparse
+from torch_geometric.utils import  scatter, softmax
+
+from torch_geometric.data import Data
+import matplotlib.pyplot as plt
+
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning)
+
+apex_support = False
+try:
+    sys.path.append('./apex')
+    from apex import amp
+
+    apex_support = True
+except:
+    print("Please install apex for mixed precision training from: https://github.com/NVIDIA/apex")
+    apex_support = False
+
+
+def _save_config_file(model_checkpoints_folder):
+    if not os.path.exists(model_checkpoints_folder):
+        os.makedirs(model_checkpoints_folder)
+        shutil.copy('./config_finetune.yaml', os.path.join(model_checkpoints_folder, 'config_finetune.yaml'))
+
+def get_roc_auc_score(y_true, y_pred, is_valid):
+    roc_list = []
+    for i in range(y_true.shape[1]):
+        #AUC is only defined when there is at least one positive data.
+        if np.sum(y_true[:,i] == 1) > 0 and np.sum(y_true[:,i] == -1) > 0:
+            is_valid = y_true[:,i]**2 > 0
+            roc_list.append(roc_auc_score((y_true[is_valid,i] + 1)/2, y_pred[is_valid,i]))
+
+    if len(roc_list) < y_true.shape[1]:
+        print("Some target is missing!")
+        print("Missing ratio: %f" %(1 - float(len(roc_list))/y_true.shape[1]))
+
+    return  sum(roc_list)/len(roc_list)
+
+
+
+
+class Normalizer(object):
+    """Normalize a Tensor and restore it later. """
+
+    def __init__(self, tensor):
+        """tensor is taken as a sample to calculate the mean and std"""
+        self.mean = torch.mean(tensor)
+        self.std = torch.std(tensor)
+
+    def norm(self, tensor):
+        return (tensor - self.mean) / self.std
+
+    def denorm(self, normed_tensor):
+        return normed_tensor * self.std + self.mean
+
+    def state_dict(self):
+        return {'mean': self.mean,
+                'std': self.std}
+
+    def load_state_dict(self, state_dict):
+        self.mean = state_dict['mean']
+        self.std = state_dict['std']
+
+
+           
+layout = {
+    "recon": {
+        "loss_end": ["Multiline", ["loss_end/train", "loss_end/validation"]],
+        "loss_recon_node" : ["Multiline", ["loss_recon_node/train"]],
+        "loss_recon_edge" : ["Multiline", ["loss_recon_edge/train"]],
+        "loss_total" : ["Multiline", ["loss_total/train", "loss_total/validation"]],
+        "accuracy_node": ["Multiline", [ "accuracy/train_recon_node", "accuracy/validation_recon_node"]],
+        "accuracy_edge": ["Multiline", [ "accuracy/train_recon_edge", "accuracy/validation_recon_edge"]],
+
+    },
+}
+
+
+# 현재 파일의 전체 경로 및 파일명
+full_path = __file__
+
+# 현재 파일명만 추출
+savefilename = os.path.basename(full_path)
+
+def calc_acc_filename(pred, label,fileName):
+            # edge prediction   
+        _, predicted_classes = torch.max(pred, dim=1) # dim=1은 노드별로 최댓값을 찾음
+
+        correct_predictions = (predicted_classes == label)
+
+        accuracy = correct_predictions.float().mean().item()
+
+        return accuracy
+
+
+
+            # edge prediction   
+        _, predicted_classes = torch.max(pred, dim=1) # dim=1은 노드별로 최댓값을 찾음
+
+
+        correct_predictions = (predicted_classes == label)
+
+        accuracy = correct_predictions.float().mean().item()
+
+        plot_class_frequencies(predicted_classes, label ,fileName)
+
+
+        return accuracy
+
+def calc_acc(pred, label):
+            # edge prediction   
+        _, predicted_classes = torch.max(pred, dim=1) # dim=1은 노드별로 최댓값을 찾음
+
+        correct_predictions = (predicted_classes == label)
+
+        accuracy = correct_predictions.float().mean().item()
+
+        return accuracy
+
+
+def plot_class_frequencies_filename(pred, label, fileName):
+
+    _, predicted_classes = torch.max(pred, dim=1) # dim=1은 노드별로 최댓값을 찾음
+
+    # Convert tensors to numpy arrays for plotting
+    predicted_classes = predicted_classes.detach().cpu().numpy()
+    label = label.detach().cpu().numpy()
+
+
+    # Get unique classes and their counts
+    classes = np.unique(np.concatenate((predicted_classes, label)))
+    pred_counts = [np.sum(predicted_classes == cls) for cls in classes]
+    label_counts = [np.sum(label == cls) for cls in classes]
+
+    # Set up the figure and axis
+    fig, ax = plt.subplots(figsize=(8, 5))
+    
+    # Set the bar width
+    bar_width = 0.35
+    # Set the index for groups
+    index = np.arange(len(classes))
+
+    # Create bars for predicted and actual labels
+    ax.bar(index, pred_counts, bar_width, label='Predicted')
+    ax.bar(index + bar_width, label_counts, bar_width, label='Actual')
+
+    ax.set_xlabel('Classes')
+    ax.set_ylabel('Frequency')
+    ax.set_title('Predicted vs Actual Class Frequencies')
+    ax.set_xticks(index + bar_width / 2)
+    ax.set_xticklabels(classes)
+    ax.legend()
+
+    # Save the plot to a file
+    plt.tight_layout()
+    dir_name = f'./plot/{args.task_name}/{args.seed}'
+    try : 
+        if not os.path.exists(dir_name):
+            os.makedirs(dir_name)
+    except OSError:
+        print('Error: Creating directory. ' +  dir_name)
+
+    full_name = os.path.join(dir_name, fileName)
+    plt.savefig(full_name)  # Saves the plot as a PNG file
+    plt.close()
+
+
+
+class FineTune(object):
+    def __init__(self, dataset, config):
+        self.config = config
+        self.device = self._get_device()
+
+
+        current_time = datetime.now().strftime('%b%d_%H-%M-%S')
+        dir_name =  savefilename + config['task_name'] + '_' + str(args.num_layer) + '_' \
+        + str(args.emb_dim) + '_' + str(args.feat_dim)  + '_' + str(args.dropout) + '_' \
+        + str(args.splitting) + '_' + str(args.deviceName) + '_' + str(args.seed) + '_' + str(current_time)
+
+        log_dir = os.path.join('finetune', dir_name)
+        self.writer = SummaryWriter(log_dir=log_dir)
+        self.writer.add_custom_scalars(layout)
+
+        self.dataset = dataset
+        if config['dataset']['task'] == 'classification':
+            self.criterion =  nn.BCEWithLogitsLoss(reduction = "none")
+        elif config['dataset']['task'] == 'regression':
+            if self.config["task_name"] in ['qm7', 'qm8', 'qm9']:
+                self.criterion = nn.L1Loss()
+            else:
+                self.criterion = nn.MSELoss()
+        self.criterion_recon = nn.CrossEntropyLoss()
+
+    def _get_device(self):
+        if torch.cuda.is_available() and self.config['gpu'] != 'cpu':
+            device = self.config['gpu']
+            torch.cuda.set_device(device)
+            args.deviceName = "cuda" + str(device[-1])
+
+        else:
+            device = 'cpu'
+            args.deviceName = 'cpu'
+
+        print("Running on:", device)
+
+        return device
+    
+    def _step_test(self, model_list, data, n_iter, data_split = 'test'):
+        # get the prediction
+
+        model, linear_pred_atoms, linear_pred_bonds = model_list
+
+        num_atom_type = 119
+        num_edge_type = 4
+
+        # get the prediction
+        node_rep, _ = model(data)  # [N,C]
+
+        for atom_idx in data.masked_atom_indices:
+            data[atom_idx] = torch.tensor([num_atom_type, 0]).to(self.device)
+
+
+        if args.mask_edge:
+
+
+          
+            node_rep_masked, output2_masked = model(data)
+
+            masked_edge_index = data.edge_index[:, data.connected_edge_indices]
+            
+
+            # edge_rep 
+            edge_rep = node_rep_masked[masked_edge_index[0]] + node_rep_masked[masked_edge_index[1]]
+
+
+            pred_edge = linear_pred_bonds(edge_rep)
+
+            mask_edge_label = data.mask_edge_label.to(pred_edge.device)
+            loss_recon_edge = self.criterion_recon(pred_edge.float(),  mask_edge_label[:,0])
+
+            pred_node = linear_pred_atoms(node_rep_masked[data.masked_atom_indices])
+            loss_recon_node = self.criterion_recon(pred_node.float(), data.mask_node_label[:,0])
+
+            total_loss = loss_recon_node + loss_recon_edge
+
+            plot_class_frequencies_filename(pred_node, data.mask_node_label[:,0], f'{data_split}_{n_iter}.png')
+
+            return total_loss, pred_node, data.mask_node_label[:,0], pred_edge, mask_edge_label[:,0]
+        
+        else:
+            node_rep_masked, output2_masked = model(data)
+
+            pred_node = linear_pred_atoms(node_rep_masked[data.masked_atom_indices])
+            loss_recon_node = self.criterion_recon(pred_node.float(), data.mask_node_label[:,0])
+
+            plot_class_frequencies_filename(pred_node, data.mask_node_label[:,0], f'{data_split}_{n_iter}.png')
+
+            total_loss = loss_recon_node
+            
+            return total_loss, pred_node, data.mask_node_label[:,0], 0, 0
+
+
+    def _step(self, model_list, data, n_iter, data_split = 'train'):
+        model, linear_pred_atoms, linear_pred_bonds = model_list
+
+        num_atom_type = 119
+        num_edge_type = 4
+
+        # get the prediction
+        _, pred = model(data)  # [N,C]
+
+        for atom_idx in data.masked_atom_indices:
+            data[atom_idx] = torch.tensor([num_atom_type, 0]).to(self.device)
+
+        if args.mask_edge:
+            
+            node_rep_masked, output2_masked = model(data)
+
+
+            for bond_idx in data.connected_edge_indices:
+                    data.edge_attr[bond_idx] = torch.tensor(
+                        [self.num_edge_type, 0])
+
+            masked_edge_index = data.edge_index[:, data.connected_edge_indices]
+            # edge_rep 
+            edge_rep = node_rep_masked[masked_edge_index[0]] + node_rep_masked[masked_edge_index[1]]
+
+            pred_edge = linear_pred_bonds(edge_rep)
+
+            
+            mask_edge_label = data.mask_edge_label.to(pred_edge.device)
+            loss_recon_edge = self.criterion_recon(pred_edge.float(),  mask_edge_label[:,0])
+
+
+            pred_node = linear_pred_atoms(node_rep_masked[data.masked_atom_indices])
+            loss_recon_node = self.criterion_recon(pred_node.float(), data.mask_node_label[:,0])
+
+        else: 
+
+            node_repre2, output2_masked= model(data, data.masked_atom_indices)
+
+            
+            pred_node = linear_pred_atoms(node_repre2[data.masked_atom_indices])
+            loss_recon_node = self.criterion_recon(pred_node.float(), data.mask_node_label[:,0])
+
+
+        plot_class_frequencies_filename(pred_node, data.mask_node_label[:,0], f'{data_split}_{n_iter}.png')
+
+        
+        if args.mask_edge:
+
+            # total_loss = loss + args.alpha * (loss_recon_node + loss_recon_edge)
+            # return pred, total_loss, loss, loss_recon_node, loss_recon_edge
+        
+        
+            total_loss = loss_recon_node + loss_recon_edge
+
+            return total_loss, loss_recon_node, loss_recon_edge, calc_acc(pred_node, data.mask_node_label[:,0]), calc_acc(pred_edge, mask_edge_label[:,0])
+        else:
+            
+            # total_loss = loss + args.alpha * loss_recon_node
+            # return pred, total_loss, loss, loss_recon_node, 0 
+        
+            total_loss = loss_recon_node
+            return total_loss, loss_recon_node, 0, calc_acc(pred_node, data.mask_node_label[:,0]),0
+
+
+    def train(self):
+        train_loader, valid_loader, test_loader = self.dataset.get_data_loaders()
+
+        self.normalizer = None
+        if self.config["task_name"] in ['qm7', 'qm9']:
+            labels = []
+            for d  in train_loader:
+                labels.append(d.y)
+            labels = torch.cat(labels)
+            self.normalizer = Normalizer(labels)
+            print(self.normalizer.mean, self.normalizer.std, labels.shape)
+
+
+        self.config['model']['num_task'] = len(self.config['dataset']['target'])
+        if self.config['model_type'] == 'gin':
+            from models.ginet_finetuneRecon import GINetRecon
+            model = GINetRecon(self.config['dataset']['task'], **self.config["model"]).to(self.device)
+            # model = self._load_pre_trained_weights(model)
+        elif self.config['model_type'] == 'gcn':
+            from models.gcn_finetune import GCN
+            model = GCN(self.config['dataset']['task'], **self.config["model"]).to(self.device)
+            # model = self._load_pre_trained_weights(model)
+
+
+
+        layer_list = []
+        for name, param in model.named_parameters():
+            if 'pred_head' in name:
+                print(name, param.requires_grad)
+                layer_list.append(name)
+
+        params = list(map(lambda x: x[1],list(filter(lambda kv: kv[0] in layer_list, model.named_parameters()))))
+        base_params = list(map(lambda x: x[1],list(filter(lambda kv: kv[0] not in layer_list, model.named_parameters()))))
+
+        linear_pred_atoms = torch.nn.Linear(args.emb_dim, 119).to(self.device)
+        linear_pred_bonds = torch.nn.Linear(args.emb_dim, 4).to(self.device)
+
+
+        optimizer_model = torch.optim.Adam(
+            [{'params': base_params, 'lr': self.config['init_base_lr']}, {'params': params}],
+            self.config['init_lr'], weight_decay=eval(self.config['weight_decay'])
+        )
+
+        optimizer_linear_pred_atoms = torch.optim.Adam(linear_pred_atoms.parameters(), lr=args.init_base_lr, weight_decay=args.weight_decay)
+        optimizer_linear_pred_bonds = torch.optim.Adam(linear_pred_bonds.parameters(), lr=args.init_base_lr, weight_decay=args.weight_decay)
+
+        model_list = [model, linear_pred_atoms, linear_pred_bonds]
+        optimizer_list = [optimizer_model, optimizer_linear_pred_atoms, optimizer_linear_pred_bonds]
+
+        if apex_support and self.config['fp16_precision']:
+            model, optimizer = amp.initialize(
+                model, optimizer, opt_level='O2', keep_batchnorm_fp32=True
+            )
+
+        model_checkpoints_folder = os.path.join(self.writer.log_dir, 'checkpoints')
+
+        # save config file
+        _save_config_file(model_checkpoints_folder)
+
+        n_iter = 0
+        valid_n_iter = 0
+        best_valid_loss = np.inf
+        best_valid_rgr = np.inf
+        best_valid_cls = 0
+
+        for epoch_counter in range(self.config['epochs']):
+            for bn, data in enumerate(train_loader):
+                predictions = []
+                labels = []
+
+                optimizer_model.zero_grad()
+                optimizer_linear_pred_atoms.zero_grad()
+                if args.mask_edge:
+                    optimizer_linear_pred_bonds.zero_grad()
+
+                data = data.to(self.device)
+                total_loss, loss_recon, loss_recon_edge, acc_node, acc_edge = self._step(model_list, data, n_iter)
+
+                if n_iter % self.config['log_every_n_steps'] == 0:
+                    # self.writer.add_scalar('loss_total/train', total_loss, global_step=n_iter)
+                    self.writer.add_scalar('loss_total/train_loss_total', total_loss, epoch_counter)
+                    self.writer.add_scalar('loss_recon_node/train_loss_recon_node', loss_recon, epoch_counter)
+                    self.writer.add_scalar('loss_recon_edge/train_loss_recon_edge', loss_recon_edge, epoch_counter)
+                    self.writer.add_scalar('accuracy/train_recon_node', acc_node, epoch_counter)
+                    self.writer.add_scalar('accuracy/train_recon_edge', acc_edge, epoch_counter)
+
+
+
+                    print(epoch_counter, bn, total_loss.item(), acc_node, acc_edge)
+
+                if apex_support and self.config['fp16_precision']:
+                    with amp.scale_loss(total_loss, optimizer) as scaled_loss:
+                        scaled_loss.backward()
+                else:
+                    total_loss.backward()
+
+                optimizer_model.step()
+                optimizer_linear_pred_atoms.step()
+                if args.mask_edge:
+                    optimizer_linear_pred_bonds.step()
+
+                n_iter += 1
+
+
+            # validate the model if requested
+            if epoch_counter % self.config['eval_every_n_epochs'] == 0:
+
+                valid_loss, valid_cls_node, valid_cls_edge  = self._validate(model_list, valid_loader)
+                valid_cls = valid_cls_node + valid_cls_edge
+
+                if valid_cls > best_valid_cls:
+                    # save the model weights
+                    best_valid_cls = valid_cls
+                    torch.save(model.state_dict(), os.path.join(model_checkpoints_folder, 'model.pth'))
+
+                self.writer.add_scalar('accuracy/validation', valid_cls, epoch_counter)
+
+                self.writer.add_scalar('loss_total/validation_loss_total', valid_loss, epoch_counter)
+                self.writer.add_scalar('accuracy/validation_recon_node', valid_cls_node, epoch_counter)
+                self.writer.add_scalar('accuracy/validation_recon_edge', valid_cls_edge, epoch_counter)
+
+                valid_n_iter += 1
+        
+        self._test(model_list, test_loader)
+
+    def _load_pre_trained_weights(self, model):
+        try:
+            checkpoints_folder = os.path.join('./ckpt', self.config['fine_tune_from'], 'checkpoints')
+            state_dict = torch.load(os.path.join(checkpoints_folder, 'model.pth'), map_location=self.device)
+            # model.load_state_dict(state_dict)
+            model.load_my_state_dict(state_dict)
+            print("Loaded pre-trained model with success.")
+        except FileNotFoundError:
+            print("Pre-trained weights not found. Training from scratch.")
+
+        return model
+
+    def _validate(self, model_list, valid_loader):
+        model, linear_pred_atoms, linear_pred_bonds = model_list
+
+        predictions_node = []
+        labels_node = []
+        predictions_edge = []
+        labels_edge = []
+
+        with torch.no_grad():
+            model.eval()
+            linear_pred_atoms.eval()
+            linear_pred_bonds.eval()
+
+            valid_loss = 0.0
+            num_data = 0
+            for bn, data in enumerate(valid_loader):
+                data = data.to(self.device)
+
+                
+                if args.mask_edge:
+                    loss, pred_node,mask_node_label0, pred_edge,mask_edge_label  = self._step_test([model, linear_pred_atoms, linear_pred_bonds], data, bn, data_split='valid')
+                    labels_node.append(mask_node_label0)
+                    predictions_node.append(pred_node)
+
+                    labels_edge.append(mask_edge_label)
+                    predictions_edge.append(pred_edge)
+
+                else:
+                    loss, pred_node, mask_node_label0, _, _ = self._step_test([model, linear_pred_atoms, linear_pred_bonds], data, bn, data_split='valid')
+
+                    labels_node.append(mask_node_label0)
+                    predictions_node.append(pred_node)
+
+                valid_loss += loss.item() * data.y.size(0)
+                num_data += data.y.size(0)
+
+            valid_loss /= num_data
+        
+        model.train()
+        linear_pred_atoms.train()
+        linear_pred_bonds.train()
+
+
+        if args.mask_edge:
+
+            labels_edge = torch.cat(labels_edge, dim=0).cpu()
+            predictions_edge = torch.cat(predictions_edge, dim=0).cpu().detach()
+
+            labels_node = torch.cat(labels_node, dim=0).cpu()
+            predictions_node = torch.cat(predictions_node, dim=0).cpu().detach()
+
+
+            accuracy_edge = calc_acc(predictions_edge, labels_edge)
+
+            accuracy_node = calc_acc(predictions_node, labels_node)
+
+
+            print('Validation loss:', valid_loss, 'edge acc:', accuracy_edge, 'node acc:', accuracy_node)
+            return valid_loss, accuracy_node, accuracy_edge
+        
+        else:
+
+            labels_node = torch.cat(labels_node, dim=0).cpu()
+            predictions_node = torch.cat(predictions_node, dim=0).cpu().detach()
+
+           
+            accuracy_node = calc_acc(predictions_node, labels_node)
+
+            
+            print('Validation loss:', valid_loss,  'node acc:', accuracy_node)
+
+            return valid_loss, accuracy_node, 0
+
+    def _test(self, model_list, test_loader):
+
+        model, linear_pred_atoms, linear_pred_bonds = model_list
+
+
+        model_path = os.path.join(self.writer.log_dir, 'checkpoints', 'model.pth')
+        state_dict = torch.load(model_path, map_location=self.device)
+        model.load_state_dict(state_dict)
+        print("Loaded trained model with success.")
+
+        num_atom_type = 119
+        num_edge_type = 4
+
+        predictions_node = []
+        labels_node = []
+        predictions_edge = []
+        labels_edge = []
+
+        with torch.no_grad():
+            model.eval()
+            linear_pred_atoms.eval()
+            linear_pred_bonds.eval()
+
+            test_loss = 0.0
+            num_data = 0
+            for bn, data in enumerate(test_loader):
+                data = data.to(self.device)
+
+                for atom_idx in data.masked_atom_indices:   
+                    data[atom_idx] = torch.tensor([num_atom_type, 0]).to(self.device)
+
+                node_rep, pred = model(data)  # [N,C]
+
+                if args.mask_edge:
+                    loss, pred_node,mask_node_label0, pred_edge,mask_edge_label  = self._step_test([model, linear_pred_atoms, linear_pred_bonds], data, bn, data_split='test')
+                    labels_node.append(mask_node_label0)
+                    predictions_node.append(pred_node)
+
+                    labels_edge.append(mask_edge_label)
+                    predictions_edge.append(pred_edge)
+
+                else:
+                    loss, pred_node, mask_node_label0, _, _ = self._step_test([model, linear_pred_atoms, linear_pred_bonds], data, bn)
+
+                    labels_node.append(mask_node_label0)
+                    predictions_node.append(pred_node)
+
+
+
+
+                test_loss += loss.item() * data.y.size(0)
+                num_data += data.y.size(0)
+
+            test_loss /= num_data
+
+            
+        if args.mask_edge:
+
+            labels_edge = torch.cat(labels_edge, dim=0).cpu()
+            predictions_edge = torch.cat(predictions_edge, dim=0).cpu().detach()
+
+            labels_node = torch.cat(labels_node, dim=0).cpu()
+            predictions_node = torch.cat(predictions_node, dim=0).cpu().detach()
+
+
+
+            accuracy_edge = calc_acc(predictions_node, labels_node)
+
+            accuracy_node = calc_acc(predictions_node, labels_node)
+
+
+            print('Test loss:', test_loss, 'Test edge acc:', accuracy_edge, 'Test node acc:', accuracy_node)
+
+            self.acc_node = accuracy_node
+            self.acc_edge = accuracy_edge
+
+        else:
+
+            labels_node = torch.cat(labels_node, dim=0).cpu()
+            predictions_node = torch.cat(predictions_node, dim=0).cpu().detach()
+
+           
+            accuracy_node = calc_acc(predictions_node, labels_node)
+
+            
+            print('Test loss:', test_loss,  'Test node acc:', accuracy_node)
+
+            self.acc_node = accuracy_node
+
+            
+
+        model.train()
+        linear_pred_atoms.train()
+        linear_pred_bonds.train()
+
+def main(config):
+
+    dataset = MolTestDatasetWrapper(config['batch_size'],
+                                    **config['dataset'],
+                                    random_masking=args.random_masking,
+                                    mask_rate=args.mask_rate,
+                                    mask_edge=args.mask_edge)
+
+    fine_tune = FineTune(dataset, config)
+    fine_tune.train()
+    
+    if args.mask_edge:
+        return fine_tune.acc_node, fine_tune.acc_edge
+    else:
+        return fine_tune.acc_node, 0
+
+
+if __name__ == "__main__":
+    config = yaml.load(open("config_finetune.yaml", "r"), Loader=yaml.FullLoader)
+
+    parser = argparse.ArgumentParser(description='PyTorch implementation of pre-training of graph neural networks')
+    parser.add_argument('--batch_size', type=int, default=32, help = "Batch size")
+    parser.add_argument('--epochs', type=int, default=200, help = "Number of training epochs")
+    parser.add_argument('--init_lr', type=float, default=0.0005, help = "Initial learning rate")
+    parser.add_argument('--init_base_lr', type=float, default=0.0001, help = "Initial learning rate for base layers")
+    parser.add_argument('--weight_decay', type=float, default=1e-6, help = "Weight decay")
+
+    parser.add_argument('--gpu', type=str, default='cuda:0', help = "GPU id. Set to 'cpu' if using CPU")
+    parser.add_argument('--model_type', type=str, default='gin', help = "Type of GNN model")
+    parser.add_argument('--num_layer', type=int, default=5, help = "Number of GNN layers")
+    parser.add_argument('--emb_dim', type=int, default=300, help = "Dimension of node embedding")
+    parser.add_argument('--feat_dim', type=int, default=300, help = "Dimension of input node features")
+    parser.add_argument('--dropout', type=float, default=0.3, help = "Dropout ratio")
+    parser.add_argument('--pool', type=str, default='mean', help = "Pooling method")
+
+
+    parser.add_argument('--seed', type=int, default=42, help = "Seed for splitting the dataset.")
+    parser.add_argument('--task_name', type=str, default='BBBP'
+                        , help = "Name of the downstream task.")
+    parser.add_argument('--splitting', type=str, default='scaffold', help = "Type of splitting for the dataset.")
+    parser.add_argument('--random_masking', type=int, default='0', help = "Whether to use random masking for the dataset.")
+    parser.add_argument('--mask_rate', type=float, default='0.2', help = "Masking rate for the dataset.")
+    parser.add_argument('--mask_edge', type=int, default=0,
+                        help='whether to mask edges osr not together with atoms')
+    parser.add_argument('--alpha', type=float, default=1, help = "Alpha for the loss function")
+
+
+    args = parser.parse_args()
+    seed = args.seed
+
+    config['batch_size'] = args.batch_size
+    config['epochs'] = args.epochs
+    config['init_lr'] = args.init_lr
+    config['init_base_lr'] = args.init_base_lr
+    # config['weight_decay'] = args.weight_decay
+    config['gpu'] = args.gpu   
+    config['model']['num_layer'] = args.num_layer
+    config['model']['emb_dim'] = args.emb_dim
+    config['model']['feat_dim'] = args.feat_dim
+    config['model']['drop_ratio'] = args.dropout
+    config['model']['pool'] = args.pool
+
+    config['task_name'] = args.task_name
+    config['dataset']['seed'] = seed
+    config['dataset']['splitting'] = args.splitting
+
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    
+    config['task_name'] = config['task_name'].lower()
+    
+
+    config = get_config(config)
+    
+    print(config)
+
+    results_list = []
+    current_time = datetime.now().strftime('%b%d_%H-%M-%S') # 시간을 지정 
+
+    # for target in target_list:
+    #     config['dataset']['target'] = target
+    #     result = main(config)
+
+    
+    acc_node, acc_edge = main(config)
+
+    columns = ['Time', 'Seed','result_node','result_edge', 'mask_rate']
+    
+
+    results_list.append([current_time, seed,  acc_node, acc_edge, args.mask_rate])
+
+
+    os.makedirs('experiments', exist_ok=True)
+    df = pd.DataFrame(results_list, columns=columns)
+
+    fn_base = 'experiments/{}_{}'.format(config['fine_tune_from'], config['task_name'])
+
+    if args.splitting == 'random':
+        fn_base += '_random'
+    elif args.splitting == 'scaffold':
+        fn_base += '_scaffold'
+    elif args.splitting == 'balanced_scaffold':
+        fn_base += '_balanced_scaffold'
+
+    
+    fn_base += '_random_masking'
+
+    if args.mask_edge:
+        fn_base += '_mask_edge'
+
+    fn_base += savefilename
+    
+    
+    fn = f"{fn_base}.csv"    
+
+    file_path = fn
+    
+    if os.path.exists(file_path):
+        # 기존 파일 읽기
+        existing_df = pd.read_csv(file_path)
+        # 새로운 데이터 추가
+        combined_df = pd.concat([existing_df, df], ignore_index=True)
+    else:
+        combined_df = df
+
+
+    combined_df.to_csv(
+        file_path, 
+        index=False, 
+    )
